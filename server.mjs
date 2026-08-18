@@ -246,23 +246,48 @@ app.post("/auth/password", async (req, res) => {
   }
 
   let authError = null;
+  let srpRetries = 0;
   try {
+    if (!item.client.connected) await item.client.connect();
+
     await item.client.signInWithPassword(
       { apiId: item.apiId, apiHash: item.apiHash },
       {
         password: async () => String(password),
         onError: async error => {
+          const raw = errorText(error);
+
+          // Telegram can invalidate the SRP id between account.GetPassword
+          // and auth.CheckPassword. GramJS can safely retry the whole loop,
+          // which fetches a fresh SRP id, when onError returns false.
+          if (/SRP_ID_INVALID/i.test(raw) && srpRetries < 3) {
+            srpRetries += 1;
+            await new Promise(resolve => setTimeout(resolve, 500));
+            return false;
+          }
+
           authError = error;
           return true;
         }
       }
     );
 
+    const authorized = await item.client.isUserAuthorized();
+    if (!authorized) {
+      throw new Error("2FA selesai tetapi sesi belum terotorisasi. Silakan minta OTP baru.");
+    }
+
     await activateClient(item);
     return res.json({ ok: true, loggedIn: true, message: "Login 2FA berhasil." });
   } catch (error) {
     const actualError = authError || error;
-    return res.status(400).json({ error: friendlyTelegramError(actualError, "Password 2FA salah.") });
+    const raw = errorText(actualError);
+    if (/SRP_ID_INVALID/i.test(raw)) {
+      return res.status(409).json({
+        error: "SRP Telegram kedaluwarsa. Klik Login & Ambil Grup untuk meminta OTP baru, lalu verifikasi OTP dan 2FA sekali lagi."
+      });
+    }
+    return res.status(400).json({ error: friendlyTelegramError(actualError, "Password 2FA gagal diverifikasi.") });
   }
 });
 

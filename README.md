@@ -1,4 +1,4 @@
-# Buzzer DivTelegram One — Telegram Backend (2FA Fixed)
+# Buzzer DivTelegram One — Telegram Backend (2FA/SRP Fixed v2)
 
 Backend Node.js/GramJS untuk login akun Telegram menggunakan OTP + Password 2FA.
 
@@ -57,3 +57,10 @@ Lalu reload website.
 File session terenkripsi disimpan ke `data/sessions.enc.json`. Pada hosting dengan filesystem ephemeral, file bisa hilang ketika instance dibuat ulang/redeploy. Untuk persistence penuh 24/7, gunakan persistent disk/database atau hosting yang menyediakan storage persisten.
 
 Jangan masukkan OTP atau Password 2FA ke `.env`, source code, atau chat. Jika API Hash pernah terlihat publik, buat kredensial API baru bila memungkinkan.
+
+
+## Fix v2 — SRP_ID_INVALID
+
+- Jika Telegram mengembalikan `SRP_ID_INVALID`, backend sekarang otomatis meminta parameter SRP baru dan mencoba ulang sampai 3 kali.
+- `PASSWORD_HASH_INVALID` tetap langsung dihentikan dan dilaporkan sebagai password 2FA salah.
+- Setelah 2FA, backend memastikan sesi benar-benar authorized sebelum menyimpannya.
