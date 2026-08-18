@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: buzzer-divtelegram-one-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: MASTER_KEY
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: https://buzzer-divtelegram-one.ba-rrettbundy7449.chatgpt.site
