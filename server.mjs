@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Api, TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
+import { CustomFile } from "telegram/client/uploads.js";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8787);
@@ -19,7 +20,7 @@ const active = new Map();
 const SESSION_TTL_MS = 10 * 60 * 1000;
 const SESSIONS_FILE = process.env.SESSIONS_FILE || path.join(process.cwd(), "data", "sessions.enc.json");
 
-app.use(express.json({ limit: "20kb" }));
+app.use(express.json({ limit: "20mb" }));
 app.use(cors({
   origin(origin, cb) {
     if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
@@ -338,6 +339,221 @@ app.get("/groups", async (req, res) => {
     return res.json({ groups });
   } catch (error) {
     return res.status(400).json({ error: friendlyTelegramError(error, "Gagal memuat grup.") });
+  }
+});
+
+
+// ---------------- SEND / MEDIA / NATIVE TELEGRAM SCHEDULER ----------------
+// Pesan terjadwal dikirim ke Telegram sebagai scheduled message. Setelah
+// Telegram menerima request schedule, PC/backend tidak perlu tetap aktif.
+const sendJobs = new Map();
+const MAX_MEDIA_BYTES = 10 * 1024 * 1024;
+const MAX_GROUPS_PER_BATCH = 200;
+const MIN_DELAY_SECONDS = 1;
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function publicJob(job) {
+  return {
+    id: job.id,
+    phone: job.phone,
+    status: job.status,
+    total: job.total,
+    sent: job.sent,
+    failed: job.failed,
+    current: job.current || "",
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt || null,
+    results: job.results.slice(-200)
+  };
+}
+
+function cleanMedia(media) {
+  if (!media) return null;
+  const name = String(media.name || "media.bin").replace(/[\\/]/g, "_").slice(0, 180);
+  const mime = String(media.mime || "application/octet-stream").slice(0, 120);
+  const data = String(media.data || "");
+  const match = data.match(/^data:([^;]+);base64,(.+)$/s);
+  const raw = match ? match[2] : data;
+  if (!/^[A-Za-z0-9+/=\s]+$/.test(raw)) throw new Error("Format media tidak valid.");
+  const buffer = Buffer.from(raw.replace(/\s/g, ""), "base64");
+  if (!buffer.length) throw new Error("File media kosong.");
+  if (buffer.length > MAX_MEDIA_BYTES) throw new Error("Media maksimal 10 MB per pengiriman.");
+  return { name, mime, buffer };
+}
+
+async function getActiveAuthorized(phone) {
+  const phoneKey = keyFor(phone);
+  const item = active.get(phoneKey);
+  if (!item) throw new Error("Akun Telegram belum login.");
+  if (!item.client.connected) await item.client.connect();
+  if (!(await item.client.isUserAuthorized())) {
+    active.delete(phoneKey);
+    await writeStoredSessions().catch(() => {});
+    throw new Error("Sesi Telegram tidak valid. Silakan login ulang.");
+  }
+  return item;
+}
+
+async function dialogMap(client) {
+  const dialogs = await client.getDialogs({ limit: 300 });
+  const map = new Map();
+  for (const d of dialogs) {
+    if (!(d.isGroup || d.isChannel)) continue;
+    map.set(String(d.id), { entity: d.entity, title: d.title || "Tanpa nama" });
+  }
+  return map;
+}
+
+async function sendOne(client, entity, message, media, scheduleUnix = undefined) {
+  if (media) {
+    const file = new CustomFile(media.name, media.buffer.length, "", media.buffer);
+    return client.sendFile(entity, {
+      file,
+      caption: message || "",
+      schedule: scheduleUnix
+    });
+  }
+  return client.sendMessage(entity, {
+    message: message || "",
+    schedule: scheduleUnix
+  });
+}
+
+async function runImmediateJob(job, payload) {
+  try {
+    const item = await getActiveAuthorized(payload.phone);
+    const groups = await dialogMap(item.client);
+    const media = cleanMedia(payload.media);
+    job.status = "running";
+    const ids = payload.groupIds.slice(0, payload.maxGroups);
+    for (let i = 0; i < ids.length; i++) {
+      if (job.stopRequested) {
+        job.status = "stopped";
+        break;
+      }
+      const id = String(ids[i]);
+      const target = groups.get(id);
+      job.current = target?.title || id;
+      if (!target) {
+        job.failed++;
+        job.results.push({ groupId: id, title: id, ok: false, error: "Grup tidak ditemukan pada akun aktif." });
+      } else {
+        try {
+          await sendOne(item.client, target.entity, payload.message, media);
+          job.sent++;
+          job.results.push({ groupId: id, title: target.title, ok: true });
+        } catch (error) {
+          job.failed++;
+          job.results.push({ groupId: id, title: target.title, ok: false, error: friendlyTelegramError(error, "Gagal mengirim.") });
+        }
+      }
+      if (i < ids.length - 1 && !job.stopRequested) await sleep(payload.delaySeconds * 1000);
+    }
+    if (job.status === "running") job.status = "done";
+  } catch (error) {
+    job.status = "failed";
+    job.results.push({ ok: false, error: friendlyTelegramError(error, "Batch gagal.") });
+  } finally {
+    job.current = "";
+    job.finishedAt = new Date().toISOString();
+  }
+}
+
+function validateSendBody(body, scheduled = false) {
+  const phone = String(body?.phone || "");
+  const groupIds = Array.isArray(body?.groupIds) ? body.groupIds.map(String).filter(Boolean) : [];
+  const message = String(body?.message || "");
+  const delaySeconds = Math.max(MIN_DELAY_SECONDS, Math.min(3600, Number(body?.delaySeconds || 1)));
+  const maxGroups = Math.max(1, Math.min(MAX_GROUPS_PER_BATCH, Number(body?.maxGroups || MAX_GROUPS_PER_BATCH)));
+  if (!phoneOk(phone)) throw new Error("Nomor Telegram tidak valid.");
+  if (!groupIds.length) throw new Error("Pilih minimal 1 grup.");
+  if (!message.trim() && !body?.media) throw new Error("Isi pesan atau pilih media.");
+  let scheduleAt = null;
+  if (scheduled) {
+    scheduleAt = new Date(body?.scheduleAt);
+    if (Number.isNaN(scheduleAt.getTime())) throw new Error("Tanggal/jam schedule tidak valid.");
+    if (scheduleAt.getTime() < Date.now() + 30_000) throw new Error("Jadwal minimal 30 detik dari sekarang.");
+  }
+  return { phone, groupIds, message, delaySeconds, maxGroups, scheduleAt, media: body?.media || null };
+}
+
+app.post("/send/start", async (req, res) => {
+  try {
+    const payload = validateSendBody(req.body, false);
+    await getActiveAuthorized(payload.phone);
+    // Validasi media sebelum job dilepas ke background.
+    if (payload.media) cleanMedia(payload.media);
+    const id = crypto.randomUUID();
+    const total = Math.min(payload.groupIds.length, payload.maxGroups);
+    const job = {
+      id, phone: payload.phone, status: "queued", total, sent: 0, failed: 0,
+      current: "", stopRequested: false, startedAt: new Date().toISOString(), finishedAt: null, results: []
+    };
+    sendJobs.set(id, job);
+    setImmediate(() => runImmediateJob(job, payload));
+    return res.json({ ok: true, job: publicJob(job) });
+  } catch (error) {
+    return res.status(400).json({ error: friendlyTelegramError(error, "Tidak bisa memulai pengiriman.") });
+  }
+});
+
+app.get("/send/jobs/:id", (req, res) => {
+  const job = sendJobs.get(String(req.params.id));
+  if (!job) return res.status(404).json({ error: "Job tidak ditemukan." });
+  return res.json({ ok: true, job: publicJob(job) });
+});
+
+app.post("/send/jobs/:id/stop", (req, res) => {
+  const job = sendJobs.get(String(req.params.id));
+  if (!job) return res.status(404).json({ error: "Job tidak ditemukan." });
+  if (["done", "failed", "stopped"].includes(job.status)) return res.json({ ok: true, job: publicJob(job) });
+  job.stopRequested = true;
+  job.status = "stopping";
+  return res.json({ ok: true, job: publicJob(job) });
+});
+
+app.post("/schedule", async (req, res) => {
+  try {
+    const payload = validateSendBody(req.body, true);
+    const item = await getActiveAuthorized(payload.phone);
+    const groups = await dialogMap(item.client);
+    const media = cleanMedia(payload.media);
+    const ids = payload.groupIds.slice(0, payload.maxGroups);
+    const baseUnix = Math.floor(payload.scheduleAt.getTime() / 1000);
+    const results = [];
+    let scheduledCount = 0;
+    let failed = 0;
+
+    for (let i = 0; i < ids.length; i++) {
+      const id = String(ids[i]);
+      const target = groups.get(id);
+      if (!target) {
+        failed++;
+        results.push({ groupId: id, title: id, ok: false, error: "Grup tidak ditemukan." });
+        continue;
+      }
+      try {
+        // Telegram menyimpan scheduled message di server mereka. Delay dijadikan
+        // selisih jadwal antar-grup, sehingga backend tidak perlu hidup pada waktu kirim.
+        const scheduleUnix = baseUnix + (i * payload.delaySeconds);
+        const msg = await sendOne(item.client, target.entity, payload.message, media, scheduleUnix);
+        scheduledCount++;
+        results.push({ groupId: id, title: target.title, ok: true, messageId: msg?.id, scheduleUnix });
+      } catch (error) {
+        failed++;
+        results.push({ groupId: id, title: target.title, ok: false, error: friendlyTelegramError(error, "Gagal menjadwalkan.") });
+      }
+    }
+    return res.json({
+      ok: failed === 0,
+      scheduled: scheduledCount,
+      failed,
+      total: ids.length,
+      scheduleAt: payload.scheduleAt.toISOString(),
+      results
+    });
+  } catch (error) {
+    return res.status(400).json({ error: friendlyTelegramError(error, "Tidak bisa membuat jadwal.") });
   }
 });
 
