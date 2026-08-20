@@ -1,20 +1,7 @@
-# Buzzer DivTelegram One — Backend Full
+# Buzzer DivTelegram One — Backend Link CTA
 
-Fitur backend:
-- Login Telegram akun dengan OTP + 2FA/SRP retry.
-- Session terenkripsi dan restore otomatis.
-- Sinkron grup/channel akun aktif.
-- Kirim pesan langsung ke banyak grup.
-- Kirim media + caption (maks. 10 MB per file).
-- Delay antar grup dan batas jumlah grup.
-- Stop batch kirim yang sedang berjalan.
-- Scheduler memakai **native Telegram scheduled messages**: setelah schedule berhasil dibuat, Telegram yang menyimpan jadwalnya; PC tidak perlu menyala saat waktu kirim.
+Backend Node.js/GramJS untuk login akun Telegram, sinkron grup, kirim pesan/media, scheduled message native Telegram, dan Link CTA.
 
-## Deploy Render
-Upload semua file folder `backend` ini untuk mengganti backend lama, commit, lalu tunggu Render `Deploy live`.
+Link CTA menerima maksimal 3 item `{label,url}` dan dirender sebagai hyperlink Markdown sehingga tetap kompatibel dengan user-account session dan scheduled messages.
 
-Environment wajib:
-- `MASTER_KEY`: string random minimal 32 karakter.
-- `ALLOWED_ORIGINS`: domain frontend, atau kosong untuk pengujian.
-
-Catatan: gunakan hanya pada grup/channel tempat akun Anda memang memiliki izin mengirim dan patuhi batas/rules Telegram.
+> Native inline keyboard buttons hanya bekerja ketika GramJS login sebagai bot.

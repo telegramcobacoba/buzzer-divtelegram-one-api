@@ -367,6 +367,32 @@ function publicJob(job) {
   };
 }
 
+function cleanLinks(value) {
+  if (!value) return [];
+  if (!Array.isArray(value)) throw new Error("Format Link CTA tidak valid.");
+  if (value.length > 3) throw new Error("Maksimal 3 Link CTA per pesan.");
+  return value.map((item, index) => {
+    const label = String(item?.label || "").trim().slice(0, 40);
+    const rawUrl = String(item?.url || "").trim();
+    if (!label || !rawUrl) throw new Error(`Link CTA ${index + 1} belum lengkap.`);
+    let parsed;
+    try { parsed = new URL(rawUrl); } catch { throw new Error(`URL Link CTA ${index + 1} tidak valid.`); }
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error(`URL Link CTA ${index + 1} harus http/https.`);
+    return { label, url: parsed.toString() };
+  });
+}
+
+function escapeMarkdownLabel(value) {
+  return String(value).replace(/([\[\]\(\)])/g, "\\$1");
+}
+
+function messageWithLinks(message, links) {
+  const base = String(message || "").trimEnd();
+  const rows = cleanLinks(links).map(link => `🔗 [${escapeMarkdownLabel(link.label)}](${link.url})`);
+  if (!rows.length) return base;
+  return `${base}${base ? "\n\n" : ""}${rows.join("\n")}`;
+}
+
 function cleanMedia(media) {
   if (!media) return null;
   const name = String(media.name || "media.bin").replace(/[\\/]/g, "_").slice(0, 180);
@@ -404,17 +430,20 @@ async function dialogMap(client) {
   return map;
 }
 
-async function sendOne(client, entity, message, media, scheduleUnix = undefined) {
+async function sendOne(client, entity, message, media, scheduleUnix = undefined, links = []) {
+  const content = messageWithLinks(message, links);
   if (media) {
     const file = new CustomFile(media.name, media.buffer.length, "", media.buffer);
     return client.sendFile(entity, {
       file,
-      caption: message || "",
+      caption: content,
+      parseMode: "md",
       schedule: scheduleUnix
     });
   }
   return client.sendMessage(entity, {
-    message: message || "",
+    message: content,
+    parseMode: "md",
     schedule: scheduleUnix
   });
 }
@@ -439,7 +468,7 @@ async function runImmediateJob(job, payload) {
         job.results.push({ groupId: id, title: id, ok: false, error: "Grup tidak ditemukan pada akun aktif." });
       } else {
         try {
-          await sendOne(item.client, target.entity, payload.message, media);
+          await sendOne(item.client, target.entity, payload.message, media, undefined, payload.links);
           job.sent++;
           job.results.push({ groupId: id, title: target.title, ok: true });
         } catch (error) {
@@ -467,14 +496,15 @@ function validateSendBody(body, scheduled = false) {
   const maxGroups = Math.max(1, Math.min(MAX_GROUPS_PER_BATCH, Number(body?.maxGroups || MAX_GROUPS_PER_BATCH)));
   if (!phoneOk(phone)) throw new Error("Nomor Telegram tidak valid.");
   if (!groupIds.length) throw new Error("Pilih minimal 1 grup.");
-  if (!message.trim() && !body?.media) throw new Error("Isi pesan atau pilih media.");
+  if (!message.trim() && !body?.media && !(Array.isArray(body?.links) && body.links.length)) throw new Error("Isi pesan, pilih media, atau tambahkan Link CTA.");
   let scheduleAt = null;
   if (scheduled) {
     scheduleAt = new Date(body?.scheduleAt);
     if (Number.isNaN(scheduleAt.getTime())) throw new Error("Tanggal/jam schedule tidak valid.");
     if (scheduleAt.getTime() < Date.now() + 30_000) throw new Error("Jadwal minimal 30 detik dari sekarang.");
   }
-  return { phone, groupIds, message, delaySeconds, maxGroups, scheduleAt, media: body?.media || null };
+  const links = cleanLinks(body?.links || []);
+  return { phone, groupIds, message, delaySeconds, maxGroups, scheduleAt, media: body?.media || null, links };
 }
 
 app.post("/send/start", async (req, res) => {
@@ -536,7 +566,7 @@ app.post("/schedule", async (req, res) => {
         // Telegram menyimpan scheduled message di server mereka. Delay dijadikan
         // selisih jadwal antar-grup, sehingga backend tidak perlu hidup pada waktu kirim.
         const scheduleUnix = baseUnix + (i * payload.delaySeconds);
-        const msg = await sendOne(item.client, target.entity, payload.message, media, scheduleUnix);
+        const msg = await sendOne(item.client, target.entity, payload.message, media, scheduleUnix, payload.links);
         scheduledCount++;
         results.push({ groupId: id, title: target.title, ok: true, messageId: msg?.id, scheduleUnix });
       } catch (error) {
