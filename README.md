@@ -1,7 +1,5 @@
-# Buzzer DivTelegram One — Backend Link CTA
+# Buzzer DivTelegram One - Multi User Production
 
-Backend Node.js/GramJS untuk login akun Telegram, sinkron grup, kirim pesan/media, scheduled message native Telegram, dan Link CTA.
+Backend Node.js dengan autentikasi dashboard server-side, isolasi session Telegram per user, PostgreSQL session store, queue pengiriman, rate limit, dan scheduler Telegram native.
 
-Link CTA menerima maksimal 3 item `{label,url}` dan dirender sebagai hyperlink Markdown sehingga tetap kompatibel dengan user-account session dan scheduled messages.
-
-> Native inline keyboard buttons hanya bekerja ketika GramJS login sebagai bot.
+Untuk pemakaian banyak user, isi DATABASE_URL PostgreSQL. Tanpa DATABASE_URL backend jatuh ke file-store development dan **tidak direkomendasikan untuk production/multi-instance**.
